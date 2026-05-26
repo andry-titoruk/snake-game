@@ -104,6 +104,8 @@
 
     let snake, dir, nextDir, food, score, best, state, interval;
     let botActive = false;
+    let survivalStreak = 0;   // ticks spent outside HUNTING mode
+    const CYCLE_THRESHOLD = 50; // after this many ticks, relax food gate + label cycle
     best = 0;
 
     // ── Utility ────────────────────────────────────────────────────────────────
@@ -292,75 +294,114 @@
       return visited.size;
     }
 
+    // ── Bot: fast reachability check (no path stored, O(cells)) ──────────────
+    // Used in survival mode to verify the tail is still accessible from each
+    // candidate neighbour without the cost of storing full path arrays.
+
+    function canReach(sx, sy, gx, gy, blocked) {
+      const visited = new Set();
+      const queue   = [{ x: sx, y: sy }];
+      visited.add(cellKey(sx, sy));
+      while (queue.length) {
+        const { x, y } = queue.shift();
+        if (x === gx && y === gy) return true;
+        for (const d of DIRS) {
+          const nx = wrap(x + d.x, COLS);
+          const ny = wrap(y + d.y, ROWS);
+          const k  = cellKey(nx, ny);
+          if (!visited.has(k) && !blocked.has(k)) {
+            visited.add(k);
+            queue.push({ x: nx, y: ny });
+          }
+        }
+      }
+      return false;
+    }
+
     // ── Bot: main step ─────────────────────────────────────────────────────────
 
     function botStep() {
       const head = snake[0];
+      const tail = snake[snake.length - 1];
 
-      // ── Conservative body set (includes tail) ─────────────────────────────
-      // The bot plans as if the body is ONE CELL LONGER than it actually is.
-      // The real game rule (tail vacates in the same tick) is still honoured
-      // in tick() — this conservatism is only in the planning layer, so the
-      // bot simply never tries to route through the tail cell.
-      const bodySet = new Set(snake.map(s => cellKey(s.x, s.y)));
-
-      // Survival BFS still needs to be able to REACH the tail (it's the goal),
-      // so we use a separate set that excludes it only for that purpose.
+      // Conservative bodySet includes the tail so paths never route through it.
+      const bodySet      = new Set(snake.map(s => cellKey(s.x, s.y)));
+      // bodySetNoTail used only where the tail itself is the goal/destination.
       const bodySetNoTail = new Set(snake.slice(0, -1).map(s => cellKey(s.x, s.y)));
 
-      const dangerMap = buildDangerMap();
+      const dangerMap  = buildDangerMap();
+      const isCycling  = survivalStreak > CYCLE_THRESHOLD;
 
-      // ── 1. Weighted Dijkstra → food, with full-path simulation safety check ──
-
+      // ── 1. Weighted Dijkstra → food ──────────────────────────────────────────
       const path = dijkstraToFood(bodySet, dangerMap);
 
       if (path) {
-        // Simulate every step; null means a collision happens along the way.
         const finalSnake = simulatePath(path);
-
         if (finalSnake) {
-          // After eating food finalSnake[0] = food/new-head.
-          // Block body[1..last] including the tail — conservative: the tail is
-          // not yet freed at the moment we land on the food cell.
-          const futureBlocked = new Set(
-            finalSnake.slice(1).map(s => cellKey(s.x, s.y))
-          );
-          const foodPos   = finalSnake[0];
-          const openSpace = floodFill(foodPos.x, foodPos.y, futureBlocked);
+          const futureBlocked = new Set(finalSnake.slice(1).map(s => cellKey(s.x, s.y)));
+          const openSpace     = floodFill(finalSnake[0].x, finalSnake[0].y, futureBlocked);
 
-          if (openSpace >= finalSnake.length) {
+          // Normal gate: need room for the whole grown snake.
+          // Cycle-breaking gate: relaxed to 60 % — the snake has been going in
+          // circles long enough; eating and reshuffling is safer than looping.
+          const threshold = isCycling
+            ? Math.ceil(finalSnake.length * 0.6)
+            : finalSnake.length;
+
+          if (openSpace >= threshold) {
+            survivalStreak = 0;
             setNextDir(head, path[0]);
-            botStatus.textContent = 'HUNTING';
+            botStatus.textContent = isCycling ? 'BREAKING' : 'HUNTING';
             return;
           }
         }
       }
 
-      // ── 2. Survival: chase own tail to keep space open ────────────────────
-
-      const tail       = snake[snake.length - 1];
-      const pathToTail = bfs(head.x, head.y, tail.x, tail.y, bodySetNoTail);
-
-      if (pathToTail) {
-        setNextDir(head, pathToTail[0]);
-        botStatus.textContent = 'SURVIVING';
-        return;
-      }
-
-      // ── 3. Last resort: pick neighbor with most reachable open space ──────
+      // ── 2. Survival: space-maximising with tail-reachability guard ───────────
+      //
+      // OLD approach — bfs(head → tail shortest path) — caused deterministic
+      // cycles: tail moves at the same speed the head approaches it, so the
+      // snake loops on the exact same route forever.
+      //
+      // NEW approach: for every safe neighbour, verify the tail is still
+      // *reachable* (canReach — fast BFS, no path stored), then pick the
+      // neighbour with the most flood-fill open space.  The snake naturally
+      // gravitates toward less-used areas and uncoils over time.
 
       let bestSpace = -1, bestD = null;
       for (const d of DIRS) {
         const nx = wrap(head.x + d.x, COLS);
         const ny = wrap(head.y + d.y, ROWS);
+        if (bodySet.has(cellKey(nx, ny))) continue;          // collision
+
+        // Safety: tail must still be reachable after taking this step.
+        if (!canReach(nx, ny, tail.x, tail.y, bodySetNoTail)) continue;
+
+        const space = floodFill(nx, ny, bodySet);
+        if (space > bestSpace) { bestSpace = space; bestD = d; }
+      }
+
+      if (bestD) {
+        survivalStreak++;
+        nextDir = bestD;
+        botStatus.textContent = isCycling ? 'CYCLE BREAK' : 'SURVIVING';
+        return;
+      }
+
+      // ── 3. Last resort: any safe direction, most open space ──────────────────
+      // (tail unreachable from all neighbours — very cornered)
+      let fallbackSpace = -1, fallbackD = null;
+      for (const d of DIRS) {
+        const nx = wrap(head.x + d.x, COLS);
+        const ny = wrap(head.y + d.y, ROWS);
         if (!bodySet.has(cellKey(nx, ny))) {
           const sp = floodFill(nx, ny, bodySet);
-          if (sp > bestSpace) { bestSpace = sp; bestD = d; }
+          if (sp > fallbackSpace) { fallbackSpace = sp; fallbackD = d; }
         }
       }
 
-      if (bestD) { nextDir = bestD; botStatus.textContent = 'ESCAPING'; }
-      else        { botStatus.textContent = 'TRAPPED'; }
+      if (fallbackD) { survivalStreak++; nextDir = fallbackD; botStatus.textContent = 'ESCAPING'; }
+      else            { botStatus.textContent = 'TRAPPED'; }
     }
 
     function setNextDir(from, to) {
@@ -383,6 +424,7 @@
       dir = { x: 1, y: 0 };
       nextDir = { x: 1, y: 0 };
       score = 0;
+      survivalStreak = 0;
       scoreEl.textContent = 0;
       placeFood();
     }
