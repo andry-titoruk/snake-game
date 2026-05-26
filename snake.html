@@ -341,12 +341,14 @@
           const futureBlocked = new Set(finalSnake.slice(1).map(s => cellKey(s.x, s.y)));
           const openSpace     = floodFill(finalSnake[0].x, finalSnake[0].y, futureBlocked);
 
-          // Normal gate: need room for the whole grown snake.
-          // Cycle-breaking gate: relaxed to 60 % — the snake has been going in
-          // circles long enough; eating and reshuffling is safer than looping.
-          const threshold = isCycling
-            ? Math.ceil(finalSnake.length * 0.6)
-            : finalSnake.length;
+          // Gate: require access to a meaningful fraction of the FREE cells
+          // from the food position — not an absolute count equal to snake length,
+          // which becomes impossible at high density (snake = 200, grid = 400 →
+          // only 200 cells are free total, so the old check could never pass).
+          // availableCells = total grid minus everything that stays blocked after eating.
+          const availableCells = COLS * ROWS - futureBlocked.size;
+          const ratio     = isCycling ? 0.4 : 0.6;
+          const threshold = Math.max(4, Math.ceil(availableCells * ratio));
 
           if (openSpace >= threshold) {
             survivalStreak = 0;
@@ -357,16 +359,20 @@
         }
       }
 
-      // ── 2. Survival: space-maximising with tail-reachability guard ───────────
+      // ── 2. Survival: gravitate toward maximum open space ─────────────────────
       //
-      // OLD approach — bfs(head → tail shortest path) — caused deterministic
-      // cycles: tail moves at the same speed the head approaches it, so the
-      // snake loops on the exact same route forever.
+      // Previous version used canReach(neighbour → tail) as a safety gate, but
+      // at high densities (50 %+ of the grid filled) the tail is buried inside
+      // the coil and genuinely unreachable from the open area — even though
+      // the open area is the safest place to be.  The strict check caused the
+      // bot to stay near the body (where the tail is reachable) and never enter
+      // the large free zone where the food is.
       //
-      // NEW approach: for every safe neighbour, verify the tail is still
-      // *reachable* (canReach — fast BFS, no path stored), then pick the
-      // neighbour with the most flood-fill open space.  The snake naturally
-      // gravitates toward less-used areas and uncoils over time.
+      // Fix: replace canReach with a flood-fill minimum threshold.  As long as
+      // a direction opens onto enough free space, it is safe to take.  Pure
+      // flood-fill maximisation already avoids pockets naturally.
+
+      const minSurvivalSpace = Math.max(4, Math.floor(snake.length * 0.15));
 
       let bestSpace = -1, bestD = null;
       for (const d of DIRS) {
@@ -374,10 +380,8 @@
         const ny = wrap(head.y + d.y, ROWS);
         if (bodySet.has(cellKey(nx, ny))) continue;          // collision
 
-        // Safety: tail must still be reachable after taking this step.
-        if (!canReach(nx, ny, tail.x, tail.y, bodySetNoTail)) continue;
-
         const space = floodFill(nx, ny, bodySet);
+        if (space < minSurvivalSpace) continue;              // avoid tiny pockets
         if (space > bestSpace) { bestSpace = space; bestD = d; }
       }
 
