@@ -1,0 +1,574 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Snake</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      background: #1a1a2e;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      height: 100vh;
+      font-family: 'Courier New', monospace;
+      color: #eee;
+    }
+    h1 { font-size: 2rem; margin-bottom: 8px; color: #4ecca3; letter-spacing: 4px; }
+    #score-board {
+      display: flex;
+      gap: 40px;
+      margin-bottom: 12px;
+      font-size: 1rem;
+    }
+    #score-board span { color: #4ecca3; font-weight: bold; }
+    canvas {
+      border: 2px solid #4ecca3;
+      border-radius: 4px;
+      box-shadow: 0 0 20px rgba(78, 204, 163, 0.3);
+    }
+    canvas.bot-active {
+      border-color: #f4a261;
+      box-shadow: 0 0 20px rgba(244, 162, 97, 0.4);
+    }
+    #overlay {
+      position: absolute;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 12px;
+    }
+    #overlay h2 { font-size: 2rem; color: #e94560; }
+    #overlay p { color: #aaa; }
+    #overlay .key { color: #4ecca3; font-weight: bold; }
+    #controls {
+      display: flex;
+      align-items: center;
+      gap: 20px;
+      margin-top: 10px;
+    }
+    #hint { font-size: 0.8rem; color: #666; }
+    #bot-btn {
+      background: transparent;
+      border: 2px solid #f4a261;
+      color: #f4a261;
+      padding: 6px 18px;
+      border-radius: 4px;
+      font-family: 'Courier New', monospace;
+      font-size: 0.85rem;
+      cursor: pointer;
+      letter-spacing: 2px;
+      transition: background 0.15s, color 0.15s;
+    }
+    #bot-btn:hover { background: #f4a261; color: #1a1a2e; }
+    #bot-btn.on { background: #f4a261; color: #1a1a2e; }
+    #bot-status { font-size: 0.75rem; color: #f4a261; height: 1em; letter-spacing: 1px; }
+  </style>
+</head>
+<body>
+  <h1>SNAKE</h1>
+  <div id="score-board">
+    <div>SCORE: <span id="score">0</span></div>
+    <div>BEST: <span id="best">0</span></div>
+  </div>
+  <div style="position:relative;">
+    <canvas id="canvas" width="400" height="400"></canvas>
+    <div id="overlay">
+      <h2 id="overlay-title">SNAKE</h2>
+      <p>Use <span class="key">WASD</span> or <span class="key">Arrow Keys</span> to move</p>
+      <p>Press <span class="key">SPACE</span> to start</p>
+    </div>
+  </div>
+  <div id="controls">
+    <div id="hint">P = pause</div>
+    <button id="bot-btn">BOT: OFF</button>
+    <div id="bot-status"></div>
+  </div>
+
+  <script>
+    const canvas = document.getElementById('canvas');
+    const ctx = canvas.getContext('2d');
+    const overlay = document.getElementById('overlay');
+    const overlayTitle = document.getElementById('overlay-title');
+    const scoreEl = document.getElementById('score');
+    const bestEl = document.getElementById('best');
+    const botBtn = document.getElementById('bot-btn');
+    const botStatus = document.getElementById('bot-status');
+
+    const GRID = 20;
+    const COLS = canvas.width  / GRID;   // 20
+    const ROWS = canvas.height / GRID;   // 20
+    const TICK = 120;
+
+    let snake, dir, nextDir, food, score, best, state, interval;
+    let botActive = false;
+    best = 0;
+
+    // ── Utility ────────────────────────────────────────────────────────────────
+
+    const wrap    = (v, max) => (v + max) % max;
+    const cellKey = (x, y)  => x * 100 + y;
+
+    const DIRS = [
+      { x: 1, y: 0 }, { x: -1, y: 0 },
+      { x: 0, y: 1 }, { x: 0, y: -1 },
+    ];
+
+    // ── Min-heap ───────────────────────────────────────────────────────────────
+
+    class MinHeap {
+      constructor() { this.h = []; }
+      get size() { return this.h.length; }
+      push(item) { this.h.push(item); this._up(this.h.length - 1); }
+      pop() {
+        const top = this.h[0];
+        const last = this.h.pop();
+        if (this.h.length) { this.h[0] = last; this._down(0); }
+        return top;
+      }
+      _up(i) {
+        while (i > 0) {
+          const p = (i - 1) >> 1;
+          if (this.h[p].cost <= this.h[i].cost) break;
+          [this.h[p], this.h[i]] = [this.h[i], this.h[p]];
+          i = p;
+        }
+      }
+      _down(i) {
+        const n = this.h.length;
+        while (true) {
+          let m = i, l = 2*i+1, r = 2*i+2;
+          if (l < n && this.h[l].cost < this.h[m].cost) m = l;
+          if (r < n && this.h[r].cost < this.h[m].cost) m = r;
+          if (m === i) break;
+          [this.h[m], this.h[i]] = [this.h[i], this.h[m]];
+          i = m;
+        }
+      }
+    }
+
+    // ── Bot: danger map ────────────────────────────────────────────────────────
+    // Precomputed once per botStep call (O(N·r²) instead of O(N) per cell).
+    // Segment i has persistence (length-i)/length — head = 1.0, tail ≈ 0.
+    // Danger radiates outward, decaying as 1/dist².
+
+    function buildDangerMap() {
+      const map = new Map();
+      const RADIUS = 5;
+      for (let i = 0; i < snake.length; i++) {
+        const seg = snake[i];
+        const persistence = (snake.length - i) / snake.length;
+        for (let dy = -RADIUS; dy <= RADIUS; dy++) {
+          for (let dx = -RADIUS; dx <= RADIUS; dx++) {
+            const dist = Math.abs(dx) + Math.abs(dy);
+            if (dist === 0 || dist > RADIUS) continue;
+            const nx = wrap(seg.x + dx, COLS);
+            const ny = wrap(seg.y + dy, ROWS);
+            const k  = cellKey(nx, ny);
+            map.set(k, (map.get(k) || 0) + (persistence * 10) / (dist * dist));
+          }
+        }
+      }
+      return map;
+    }
+
+    // ── Bot: Dijkstra with full-path reconstruction ────────────────────────────
+    // Returns array of {x,y} positions [step1, step2, ..., food], or null.
+    // Each position is where the snake head will be after that step.
+
+    function dijkstraToFood(bodySet, dangerMap) {
+      const head    = snake[0];
+      const headKey = cellKey(head.x, head.y);
+      const dist    = new Map();
+      // parent: childKey → { prevKey, x, y }  (position of child, key of parent)
+      const parent  = new Map();
+      const pq      = new MinHeap();
+
+      dist.set(headKey, 0);
+      pq.push({ cost: 0, x: head.x, y: head.y });
+
+      let found = false;
+
+      while (pq.size > 0) {
+        const { cost, x, y } = pq.pop();
+        const k = cellKey(x, y);
+        if (cost > (dist.get(k) ?? Infinity) + 1e-9) continue;
+        if (x === food.x && y === food.y) { found = true; break; }
+
+        for (const d of DIRS) {
+          const nx = wrap(x + d.x, COLS);
+          const ny = wrap(y + d.y, ROWS);
+          const nk = cellKey(nx, ny);
+          if (bodySet.has(nk)) continue;
+
+          // Cost = 1 (base) + precomputed danger for this cell
+          const nc = cost + 1 + (dangerMap.get(nk) || 0);
+          if (nc < (dist.get(nk) ?? Infinity)) {
+            dist.set(nk, nc);
+            parent.set(nk, { prevKey: k, x: nx, y: ny });
+            pq.push({ cost: nc, x: nx, y: ny });
+          }
+        }
+      }
+
+      if (!found) return null;
+
+      // Reconstruct path from food back to head
+      const path = [];
+      let curr = cellKey(food.x, food.y);
+      while (parent.has(curr)) {
+        const node = parent.get(curr);
+        path.unshift({ x: node.x, y: node.y });
+        curr = node.prevKey;
+      }
+      return path.length > 0 ? path : null;
+    }
+
+    // ── Bot: step-by-step path simulation ─────────────────────────────────────
+    // Walks through every step of the path, updating the simulated snake body
+    // at each tick (freeing the tail unless food is eaten).
+    // Returns the final snake array, or null if any step causes a collision.
+    //
+    // This is the KEY fix: the old safety check only simulated 1 step, treating
+    // it as if food were eaten there.  Here we simulate the whole multi-step
+    // journey with the correct body configuration at every intermediate tick.
+
+    function simulatePath(path) {
+      let sim = snake.slice(); // shallow copy; positions are immutable objects
+      for (const pos of path) {
+        const eats = (pos.x === food.x && pos.y === food.y);
+        // Conservative: check against the FULL simulated body including the tail.
+        // The tail cell is treated as permanently occupied in the planning layer,
+        // matching the conservative bodySet used by Dijkstra above.
+        if (sim.some(s => s.x === pos.x && s.y === pos.y)) return null;
+        sim = [pos, ...sim];
+        if (!eats) sim.pop();
+      }
+      return sim; // final snake state after fully traversing path
+    }
+
+    // ── Bot: BFS (for tail-chasing survival) ──────────────────────────────────
+
+    function bfs(sx, sy, gx, gy, blocked) {
+      const visited = new Set();
+      const queue   = [{ x: sx, y: sy, path: [] }];
+      visited.add(cellKey(sx, sy));
+      while (queue.length) {
+        const { x, y, path } = queue.shift();
+        for (const d of DIRS) {
+          const nx = wrap(x + d.x, COLS);
+          const ny = wrap(y + d.y, ROWS);
+          const k  = cellKey(nx, ny);
+          if (visited.has(k) || blocked.has(k)) continue;
+          const np = [...path, { x: nx, y: ny }];
+          if (nx === gx && ny === gy) return np;
+          visited.add(k);
+          queue.push({ x: nx, y: ny, path: np });
+        }
+      }
+      return null;
+    }
+
+    // ── Bot: flood fill ────────────────────────────────────────────────────────
+
+    function floodFill(sx, sy, blocked) {
+      const visited = new Set();
+      const queue   = [{ x: sx, y: sy }];
+      visited.add(cellKey(sx, sy));
+      while (queue.length) {
+        const { x, y } = queue.shift();
+        for (const d of DIRS) {
+          const nx = wrap(x + d.x, COLS);
+          const ny = wrap(y + d.y, ROWS);
+          const k  = cellKey(nx, ny);
+          if (!visited.has(k) && !blocked.has(k)) {
+            visited.add(k);
+            queue.push({ x: nx, y: ny });
+          }
+        }
+      }
+      return visited.size;
+    }
+
+    // ── Bot: main step ─────────────────────────────────────────────────────────
+
+    function botStep() {
+      const head = snake[0];
+
+      // ── Conservative body set (includes tail) ─────────────────────────────
+      // The bot plans as if the body is ONE CELL LONGER than it actually is.
+      // The real game rule (tail vacates in the same tick) is still honoured
+      // in tick() — this conservatism is only in the planning layer, so the
+      // bot simply never tries to route through the tail cell.
+      const bodySet = new Set(snake.map(s => cellKey(s.x, s.y)));
+
+      // Survival BFS still needs to be able to REACH the tail (it's the goal),
+      // so we use a separate set that excludes it only for that purpose.
+      const bodySetNoTail = new Set(snake.slice(0, -1).map(s => cellKey(s.x, s.y)));
+
+      const dangerMap = buildDangerMap();
+
+      // ── 1. Weighted Dijkstra → food, with full-path simulation safety check ──
+
+      const path = dijkstraToFood(bodySet, dangerMap);
+
+      if (path) {
+        // Simulate every step; null means a collision happens along the way.
+        const finalSnake = simulatePath(path);
+
+        if (finalSnake) {
+          // After eating food finalSnake[0] = food/new-head.
+          // Block body[1..last] including the tail — conservative: the tail is
+          // not yet freed at the moment we land on the food cell.
+          const futureBlocked = new Set(
+            finalSnake.slice(1).map(s => cellKey(s.x, s.y))
+          );
+          const foodPos   = finalSnake[0];
+          const openSpace = floodFill(foodPos.x, foodPos.y, futureBlocked);
+
+          if (openSpace >= finalSnake.length) {
+            setNextDir(head, path[0]);
+            botStatus.textContent = 'HUNTING';
+            return;
+          }
+        }
+      }
+
+      // ── 2. Survival: chase own tail to keep space open ────────────────────
+
+      const tail       = snake[snake.length - 1];
+      const pathToTail = bfs(head.x, head.y, tail.x, tail.y, bodySetNoTail);
+
+      if (pathToTail) {
+        setNextDir(head, pathToTail[0]);
+        botStatus.textContent = 'SURVIVING';
+        return;
+      }
+
+      // ── 3. Last resort: pick neighbor with most reachable open space ──────
+
+      let bestSpace = -1, bestD = null;
+      for (const d of DIRS) {
+        const nx = wrap(head.x + d.x, COLS);
+        const ny = wrap(head.y + d.y, ROWS);
+        if (!bodySet.has(cellKey(nx, ny))) {
+          const sp = floodFill(nx, ny, bodySet);
+          if (sp > bestSpace) { bestSpace = sp; bestD = d; }
+        }
+      }
+
+      if (bestD) { nextDir = bestD; botStatus.textContent = 'ESCAPING'; }
+      else        { botStatus.textContent = 'TRAPPED'; }
+    }
+
+    function setNextDir(from, to) {
+      let dx = to.x - from.x;
+      let dy = to.y - from.y;
+      // Handle toroidal wrap-around
+      if (dx >  1) dx = -1; if (dx < -1) dx = 1;
+      if (dy >  1) dy = -1; if (dy < -1) dy = 1;
+      nextDir = { x: dx, y: dy };
+    }
+
+    // ── Game core ──────────────────────────────────────────────────────────────
+
+    function init() {
+      snake = [
+        { x: 10, y: 10 },
+        { x: 9,  y: 10 },
+        { x: 8,  y: 10 },
+      ];
+      dir = { x: 1, y: 0 };
+      nextDir = { x: 1, y: 0 };
+      score = 0;
+      scoreEl.textContent = 0;
+      placeFood();
+    }
+
+    function placeFood() {
+      let pos;
+      do {
+        pos = {
+          x: Math.floor(Math.random() * COLS),
+          y: Math.floor(Math.random() * ROWS),
+        };
+      } while (snake.some(s => s.x === pos.x && s.y === pos.y));
+      food = pos;
+    }
+
+    function tick() {
+      if (botActive) botStep();
+
+      dir = nextDir;
+      const head = {
+        x: wrap(snake[0].x + dir.x, COLS),
+        y: wrap(snake[0].y + dir.y, ROWS),
+      };
+
+      // ── FIX (Bug 1): tail vacates in the same tick unless food is eaten ──
+      // Old code: snake.some(...) — included the tail, causing false collisions
+      // when the bot (correctly) moved to where the tail was.
+      const eatingFood = (head.x === food.x && head.y === food.y);
+      const colBody    = eatingFood ? snake : snake.slice(0, -1);
+      if (colBody.some(s => s.x === head.x && s.y === head.y)) {
+        return gameOver();
+      }
+
+      snake.unshift(head);
+
+      if (eatingFood) {
+        score++;
+        scoreEl.textContent = score;
+        if (score > best) { best = score; bestEl.textContent = best; }
+        placeFood();
+      } else {
+        snake.pop();
+      }
+
+      draw();
+    }
+
+    // ── Rendering ──────────────────────────────────────────────────────────────
+
+    function draw() {
+      ctx.fillStyle = '#16213e';
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+      // Grid dots
+      ctx.fillStyle = '#1a2a4a';
+      for (let r = 0; r < ROWS; r++) {
+        for (let c = 0; c < COLS; c++) {
+          ctx.fillRect(c * GRID + GRID/2 - 1, r * GRID + GRID/2 - 1, 2, 2);
+        }
+      }
+
+      // Food
+      ctx.fillStyle = '#e94560';
+      ctx.beginPath();
+      ctx.arc(food.x * GRID + GRID/2, food.y * GRID + GRID/2, GRID/2 - 2, 0, Math.PI * 2);
+      ctx.fill();
+
+      // Snake
+      const headColor = botActive ? '#f4a261' : '#4ecca3';
+      snake.forEach((seg, i) => {
+        const t = i / snake.length;
+        ctx.fillStyle = i === 0
+          ? headColor
+          : botActive
+            ? `hsl(${30 - t * 20}, 80%, ${50 - t * 15}%)`
+            : `hsl(${160 - t * 40}, 70%, ${50 - t * 15}%)`;
+        const pad = i === 0 ? 1 : 2;
+        roundRect(ctx, seg.x * GRID + pad, seg.y * GRID + pad, GRID - pad*2, GRID - pad*2, 4);
+        ctx.fill();
+
+        if (i === 0) {
+          ctx.fillStyle = '#16213e';
+          const [ex1, ey1, ex2, ey2] = eyePositions(dir, seg);
+          ctx.beginPath(); ctx.arc(ex1, ey1, 2, 0, Math.PI*2); ctx.fill();
+          ctx.beginPath(); ctx.arc(ex2, ey2, 2, 0, Math.PI*2); ctx.fill();
+        }
+      });
+    }
+
+    function eyePositions(d, seg) {
+      const cx = seg.x * GRID + GRID/2, cy = seg.y * GRID + GRID/2, off = 4;
+      if (d.x === 1)  return [cx+4, cy-off, cx+4, cy+off];
+      if (d.x === -1) return [cx-4, cy-off, cx-4, cy+off];
+      if (d.y === -1) return [cx-off, cy-4, cx+off, cy-4];
+      return [cx-off, cy+4, cx+off, cy+4];
+    }
+
+    function roundRect(ctx, x, y, w, h, r) {
+      ctx.beginPath();
+      ctx.moveTo(x+r, y);
+      ctx.lineTo(x+w-r, y); ctx.quadraticCurveTo(x+w, y, x+w, y+r);
+      ctx.lineTo(x+w, y+h-r); ctx.quadraticCurveTo(x+w, y+h, x+w-r, y+h);
+      ctx.lineTo(x+r, y+h); ctx.quadraticCurveTo(x, y+h, x, y+h-r);
+      ctx.lineTo(x, y+r); ctx.quadraticCurveTo(x, y, x+r, y);
+      ctx.closePath();
+    }
+
+    // ── State transitions ──────────────────────────────────────────────────────
+
+    function gameOver() {
+      clearInterval(interval);
+      state = 'over';
+      if (botActive) { setTimeout(startGame, 400); return; }
+      overlayTitle.textContent = 'GAME OVER';
+      overlayTitle.style.color = '#e94560';
+      overlay.style.display = 'flex';
+      overlay.children[1].textContent = `Score: ${score}`;
+      overlay.children[2].innerHTML = 'Press <span class="key">SPACE</span> to play again';
+    }
+
+    function startGame() {
+      overlay.style.display = 'none';
+      init();
+      state = 'playing';
+      clearInterval(interval);
+      interval = setInterval(tick, TICK);
+      draw();
+    }
+
+    function pauseGame() {
+      if (state === 'playing') {
+        clearInterval(interval);
+        state = 'paused';
+        overlayTitle.textContent = 'PAUSED';
+        overlayTitle.style.color = '#4ecca3';
+        overlay.style.display = 'flex';
+        overlay.children[1].textContent = '';
+        overlay.children[2].innerHTML = 'Press <span class="key">P</span> or <span class="key">SPACE</span> to resume';
+      } else if (state === 'paused') {
+        overlay.style.display = 'none';
+        state = 'playing';
+        interval = setInterval(tick, TICK);
+      }
+    }
+
+    function toggleBot() {
+      botActive = !botActive;
+      botBtn.textContent = `BOT: ${botActive ? 'ON' : 'OFF'}`;
+      botBtn.classList.toggle('on', botActive);
+      canvas.classList.toggle('bot-active', botActive);
+      if (!botActive) botStatus.textContent = '';
+      if (botActive && (state === 'idle' || state === 'over')) startGame();
+    }
+
+    // ── Input ──────────────────────────────────────────────────────────────────
+
+    botBtn.addEventListener('click', toggleBot);
+
+    document.addEventListener('keydown', e => {
+      const k = e.key;
+      if (k === 'b' || k === 'B') { toggleBot(); return; }
+      if (k === ' ') {
+        e.preventDefault();
+        if (state === 'idle' || state === 'over') startGame();
+        else if (state === 'paused') pauseGame();
+        return;
+      }
+      if (k === 'p' || k === 'P') {
+        if (state === 'playing' || state === 'paused') pauseGame();
+        return;
+      }
+      if (state !== 'playing' || botActive) return;
+      const moves = {
+        ArrowUp:    { x:0, y:-1 }, w: { x:0, y:-1 }, W: { x:0, y:-1 },
+        ArrowDown:  { x:0, y:1  }, s: { x:0, y:1  }, S: { x:0, y:1  },
+        ArrowLeft:  { x:-1,y:0  }, a: { x:-1,y:0  }, A: { x:-1,y:0  },
+        ArrowRight: { x:1, y:0  }, d: { x:1, y:0  }, D: { x:1, y:0  },
+      };
+      const m = moves[k];
+      if (m && !(m.x === -dir.x && m.y === -dir.y)) { e.preventDefault(); nextDir = m; }
+    });
+
+    // Initial draw
+    state = 'idle';
+    ctx.fillStyle = '#16213e';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+  </script>
+</body>
+</html>
