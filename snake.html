@@ -65,6 +65,22 @@
     #bot-btn:hover { background: #f4a261; color: #1a1a2e; }
     #bot-btn.on { background: #f4a261; color: #1a1a2e; }
     #bot-status { font-size: 0.75rem; color: #f4a261; height: 1em; letter-spacing: 1px; }
+    #speed-group { display: flex; align-items: center; gap: 4px; }
+    #speed-label { font-size: 0.75rem; color: #666; margin-right: 2px; letter-spacing: 1px; }
+    .spd {
+      background: transparent;
+      border: 1px solid #4ecca355;
+      color: #4ecca3;
+      padding: 4px 9px;
+      border-radius: 3px;
+      font-family: 'Courier New', monospace;
+      font-size: 0.75rem;
+      cursor: pointer;
+      letter-spacing: 1px;
+      transition: background 0.1s, color 0.1s, border-color 0.1s;
+    }
+    .spd:hover  { border-color: #4ecca3; background: #4ecca322; }
+    .spd.active { background: #4ecca3;   color: #1a1a2e; border-color: #4ecca3; }
   </style>
 </head>
 <body>
@@ -82,9 +98,17 @@
     </div>
   </div>
   <div id="controls">
-    <div id="hint">P = pause</div>
+    <div id="hint">P = pause &nbsp;|&nbsp; [ ] = speed</div>
     <button id="bot-btn">BOT: OFF</button>
     <div id="bot-status"></div>
+    <div id="speed-group">
+      <span id="speed-label">SPEED:</span>
+      <button class="spd active" data-mult="1">1×</button>
+      <button class="spd" data-mult="2">2×</button>
+      <button class="spd" data-mult="5">5×</button>
+      <button class="spd" data-mult="10">10×</button>
+      <button class="spd" data-mult="20">20×</button>
+    </div>
   </div>
 
   <script>
@@ -108,6 +132,28 @@
     const CYCLE_THRESHOLD = 50; // after this many ticks, relax food gate + label cycle
     best = 0;
 
+    // ── Speed control ──────────────────────────────────────────────────────────
+    let speedMult = 1;
+    const spdBtns = document.querySelectorAll('.spd');
+
+    function setSpeed(mult) {
+      speedMult = mult;
+      spdBtns.forEach(b => b.classList.toggle('active', +b.dataset.mult === mult));
+      if (state === 'playing') {
+        clearInterval(interval);
+        interval = setInterval(tick, Math.max(1, Math.round(TICK / speedMult)));
+      }
+    }
+
+    spdBtns.forEach(b => b.addEventListener('click', () => setSpeed(+b.dataset.mult)));
+
+    const SPEED_STEPS = [1, 2, 5, 10, 20];
+    function stepSpeed(dir) {
+      const idx = SPEED_STEPS.indexOf(speedMult);
+      const next = SPEED_STEPS[Math.min(Math.max(idx + dir, 0), SPEED_STEPS.length - 1)];
+      setSpeed(next);
+    }
+
     // ── Utility ────────────────────────────────────────────────────────────────
 
     const wrap    = (v, max) => (v + max) % max;
@@ -117,6 +163,31 @@
       { x: 1, y: 0 }, { x: -1, y: 0 },
       { x: 0, y: 1 }, { x: 0, y: -1 },
     ];
+
+    // ── Hamiltonian cycle (boustrophedon) ──────────────────────────────────────
+    // Even rows sweep left→right; odd rows right→left.
+    // On a toroidal grid the last cell (0, ROWS-1) is adjacent to (0, 0) via the
+    // vertical wrap, so the path closes into a perfect cycle that visits every
+    // cell exactly once.  Following it strictly guarantees no dead ends can form.
+
+    const HAM_THRESHOLD = 150;   // snake length at which Hamiltonian mode activates
+
+    const HAM_POS  = {};         // cellKey(x,y) → 0-based position in cycle
+    const HAM_CELL = [];         // cycle position → {x, y}
+    (function buildHamCycle() {
+      for (let y = 0; y < ROWS; y++) {
+        for (let x = 0; x < COLS; x++) {
+          const pos = (y % 2 === 0) ? (y * COLS + x) : (y * COLS + (COLS - 1 - x));
+          HAM_POS[cellKey(x, y)] = pos;
+          HAM_CELL[pos] = { x, y };
+        }
+      }
+    })();
+
+    // Return the cell that immediately follows (x, y) in the Hamiltonian cycle.
+    function hamCycleNext(x, y) {
+      return HAM_CELL[(HAM_POS[cellKey(x, y)] + 1) % (COLS * ROWS)];
+    }
 
     // ── Min-heap ───────────────────────────────────────────────────────────────
 
@@ -331,6 +402,78 @@
 
       const dangerMap  = buildDangerMap();
       const isCycling  = survivalStreak > CYCLE_THRESHOLD;
+
+      // ── 0. Hamiltonian cycle mode (snake.length ≥ HAM_THRESHOLD) ─────────────
+      // At high density a boustrophedon Hamiltonian cycle eliminates dead ends by
+      // design: the snake sweeps each row completely before U-turning to the next,
+      // closing the loop via the toroidal bottom edge.
+      //
+      // Three-tier strategy that matches — never undercuts — the quality of the
+      // normal Dijkstra + flood-fill tiers below:
+      //   a) Dijkstra shortcut with the SAME open-space threshold as tier 1
+      //      (60 % normal / 40 % cycling).  A more lenient gate here was the
+      //      root cause of the performance regression: it approved paths that
+      //      tier 1 would correctly reject, leaving the snake in worse positions.
+      //   b) Flood-fill survival identical to tier 2, but with the Hamiltonian
+      //      cycle direction used as a tiebreaker when two neighbours are equal.
+      //      This keeps the snake space-aware while gently nudging it along the
+      //      cycle so it doesn't need to rely on the strict step as often.
+      //   c) Strict cycle step only as a true last resort — when every neighbour
+      //      fails the flood-fill minimum.  Previously this fired as soon as (a)
+      //      failed, overriding the flood-fill logic and causing avoidable deaths.
+      if (snake.length >= HAM_THRESHOLD) {
+        // — a) Dijkstra shortcut (same threshold as tier 1) —
+        const hamPath = dijkstraToFood(bodySet, dangerMap);
+        if (hamPath) {
+          const hamFinal = simulatePath(hamPath);
+          if (hamFinal) {
+            const hamBlocked = new Set(hamFinal.slice(1).map(s => cellKey(s.x, s.y)));
+            const hamOpen    = floodFill(hamFinal[0].x, hamFinal[0].y, hamBlocked);
+            const hamAvail   = COLS * ROWS - hamBlocked.size;
+            const hamRatio   = isCycling ? 0.4 : 0.6;
+            if (hamOpen >= Math.max(4, Math.ceil(hamAvail * hamRatio))) {
+              survivalStreak = 0;
+              setNextDir(head, hamPath[0]);
+              botStatus.textContent = 'HAM-HUNT';
+              return;
+            }
+          }
+        }
+
+        // — b) Flood-fill survival with cycle tiebreaker —
+        const cycleNext       = hamCycleNext(head.x, head.y);
+        const minHamSpace     = Math.max(4, Math.floor(snake.length * 0.15));
+        let hamBestSpace = -1, hamBestD = null;
+        for (const d of DIRS) {
+          const nx = wrap(head.x + d.x, COLS);
+          const ny = wrap(head.y + d.y, ROWS);
+          if (bodySet.has(cellKey(nx, ny))) continue;
+          const space = floodFill(nx, ny, bodySet);
+          if (space < minHamSpace) continue;
+          // Prefer cycle direction on ties to gently align with the Hamiltonian path
+          const isCycleDir = nx === cycleNext.x && ny === cycleNext.y;
+          if (space > hamBestSpace || (space === hamBestSpace && isCycleDir)) {
+            hamBestSpace = space; hamBestD = d;
+          }
+        }
+        if (hamBestD) {
+          survivalStreak++;
+          nextDir = hamBestD;
+          botStatus.textContent = isCycling ? 'HAM-CYCLE' : 'HAM-SURVIVE';
+          return;
+        }
+
+        // — c) Strict cycle step (true last resort) —
+        const cycleKey = cellKey(cycleNext.x, cycleNext.y);
+        const isTail   = cycleNext.x === tail.x && cycleNext.y === tail.y;
+        if (!bodySet.has(cycleKey) || isTail) {
+          survivalStreak = 0;
+          setNextDir(head, cycleNext);
+          botStatus.textContent = 'HAMILTONIAN';
+          return;
+        }
+        // Cycle step blocked after shortcuts → fall through to regular last resort.
+      }
 
       // ── 1. Weighted Dijkstra → food ──────────────────────────────────────────
       const path = dijkstraToFood(bodySet, dangerMap);
@@ -554,7 +697,7 @@
       init();
       state = 'playing';
       clearInterval(interval);
-      interval = setInterval(tick, TICK);
+      interval = setInterval(tick, Math.max(1, Math.round(TICK / speedMult)));
       draw();
     }
 
@@ -570,7 +713,7 @@
       } else if (state === 'paused') {
         overlay.style.display = 'none';
         state = 'playing';
-        interval = setInterval(tick, TICK);
+        interval = setInterval(tick, Math.max(1, Math.round(TICK / speedMult)));
       }
     }
 
@@ -590,6 +733,8 @@
     document.addEventListener('keydown', e => {
       const k = e.key;
       if (k === 'b' || k === 'B') { toggleBot(); return; }
+      if (k === ']') { stepSpeed(+1); return; }
+      if (k === '[') { stepSpeed(-1); return; }
       if (k === ' ') {
         e.preventDefault();
         if (state === 'idle' || state === 'over') startGame();
