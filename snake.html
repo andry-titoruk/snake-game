@@ -128,8 +128,6 @@
 
     let snake, dir, nextDir, food, score, best, state, interval;
     let botActive = false;
-    let survivalStreak = 0;   // ticks spent outside HUNTING mode
-    const CYCLE_THRESHOLD = 50; // after this many ticks, relax food gate + label cycle
     best = 0;
 
     // ── Speed control ──────────────────────────────────────────────────────────
@@ -170,8 +168,6 @@
     // vertical wrap, so the path closes into a perfect cycle that visits every
     // cell exactly once.  Following it strictly guarantees no dead ends can form.
 
-    const HAM_THRESHOLD = 150;   // snake length at which Hamiltonian mode activates
-
     const HAM_POS  = {};         // cellKey(x,y) → 0-based position in cycle
     const HAM_CELL = [];         // cycle position → {x, y}
     (function buildHamCycle() {
@@ -187,161 +183,6 @@
     // Return the cell that immediately follows (x, y) in the Hamiltonian cycle.
     function hamCycleNext(x, y) {
       return HAM_CELL[(HAM_POS[cellKey(x, y)] + 1) % (COLS * ROWS)];
-    }
-
-    // ── Min-heap ───────────────────────────────────────────────────────────────
-
-    class MinHeap {
-      constructor() { this.h = []; }
-      get size() { return this.h.length; }
-      push(item) { this.h.push(item); this._up(this.h.length - 1); }
-      pop() {
-        const top = this.h[0];
-        const last = this.h.pop();
-        if (this.h.length) { this.h[0] = last; this._down(0); }
-        return top;
-      }
-      _up(i) {
-        while (i > 0) {
-          const p = (i - 1) >> 1;
-          if (this.h[p].cost <= this.h[i].cost) break;
-          [this.h[p], this.h[i]] = [this.h[i], this.h[p]];
-          i = p;
-        }
-      }
-      _down(i) {
-        const n = this.h.length;
-        while (true) {
-          let m = i, l = 2*i+1, r = 2*i+2;
-          if (l < n && this.h[l].cost < this.h[m].cost) m = l;
-          if (r < n && this.h[r].cost < this.h[m].cost) m = r;
-          if (m === i) break;
-          [this.h[m], this.h[i]] = [this.h[i], this.h[m]];
-          i = m;
-        }
-      }
-    }
-
-    // ── Bot: danger map ────────────────────────────────────────────────────────
-    // Precomputed once per botStep call (O(N·r²) instead of O(N) per cell).
-    // Segment i has persistence (length-i)/length — head = 1.0, tail ≈ 0.
-    // Danger radiates outward, decaying as 1/dist².
-
-    function buildDangerMap() {
-      const map = new Map();
-      const RADIUS = 5;
-      for (let i = 0; i < snake.length; i++) {
-        const seg = snake[i];
-        const persistence = (snake.length - i) / snake.length;
-        for (let dy = -RADIUS; dy <= RADIUS; dy++) {
-          for (let dx = -RADIUS; dx <= RADIUS; dx++) {
-            const dist = Math.abs(dx) + Math.abs(dy);
-            if (dist === 0 || dist > RADIUS) continue;
-            const nx = wrap(seg.x + dx, COLS);
-            const ny = wrap(seg.y + dy, ROWS);
-            const k  = cellKey(nx, ny);
-            map.set(k, (map.get(k) || 0) + (persistence * 10) / (dist * dist));
-          }
-        }
-      }
-      return map;
-    }
-
-    // ── Bot: Dijkstra with full-path reconstruction ────────────────────────────
-    // Returns array of {x,y} positions [step1, step2, ..., food], or null.
-    // Each position is where the snake head will be after that step.
-
-    function dijkstraToFood(bodySet, dangerMap) {
-      const head    = snake[0];
-      const headKey = cellKey(head.x, head.y);
-      const dist    = new Map();
-      // parent: childKey → { prevKey, x, y }  (position of child, key of parent)
-      const parent  = new Map();
-      const pq      = new MinHeap();
-
-      dist.set(headKey, 0);
-      pq.push({ cost: 0, x: head.x, y: head.y });
-
-      let found = false;
-
-      while (pq.size > 0) {
-        const { cost, x, y } = pq.pop();
-        const k = cellKey(x, y);
-        if (cost > (dist.get(k) ?? Infinity) + 1e-9) continue;
-        if (x === food.x && y === food.y) { found = true; break; }
-
-        for (const d of DIRS) {
-          const nx = wrap(x + d.x, COLS);
-          const ny = wrap(y + d.y, ROWS);
-          const nk = cellKey(nx, ny);
-          if (bodySet.has(nk)) continue;
-
-          // Cost = 1 (base) + precomputed danger for this cell
-          const nc = cost + 1 + (dangerMap.get(nk) || 0);
-          if (nc < (dist.get(nk) ?? Infinity)) {
-            dist.set(nk, nc);
-            parent.set(nk, { prevKey: k, x: nx, y: ny });
-            pq.push({ cost: nc, x: nx, y: ny });
-          }
-        }
-      }
-
-      if (!found) return null;
-
-      // Reconstruct path from food back to head
-      const path = [];
-      let curr = cellKey(food.x, food.y);
-      while (parent.has(curr)) {
-        const node = parent.get(curr);
-        path.unshift({ x: node.x, y: node.y });
-        curr = node.prevKey;
-      }
-      return path.length > 0 ? path : null;
-    }
-
-    // ── Bot: step-by-step path simulation ─────────────────────────────────────
-    // Walks through every step of the path, updating the simulated snake body
-    // at each tick (freeing the tail unless food is eaten).
-    // Returns the final snake array, or null if any step causes a collision.
-    //
-    // This is the KEY fix: the old safety check only simulated 1 step, treating
-    // it as if food were eaten there.  Here we simulate the whole multi-step
-    // journey with the correct body configuration at every intermediate tick.
-
-    function simulatePath(path) {
-      let sim = snake.slice(); // shallow copy; positions are immutable objects
-      for (const pos of path) {
-        const eats = (pos.x === food.x && pos.y === food.y);
-        // Conservative: check against the FULL simulated body including the tail.
-        // The tail cell is treated as permanently occupied in the planning layer,
-        // matching the conservative bodySet used by Dijkstra above.
-        if (sim.some(s => s.x === pos.x && s.y === pos.y)) return null;
-        sim = [pos, ...sim];
-        if (!eats) sim.pop();
-      }
-      return sim; // final snake state after fully traversing path
-    }
-
-    // ── Bot: BFS (for tail-chasing survival) ──────────────────────────────────
-
-    function bfs(sx, sy, gx, gy, blocked) {
-      const visited = new Set();
-      const queue   = [{ x: sx, y: sy, path: [] }];
-      visited.add(cellKey(sx, sy));
-      while (queue.length) {
-        const { x, y, path } = queue.shift();
-        for (const d of DIRS) {
-          const nx = wrap(x + d.x, COLS);
-          const ny = wrap(y + d.y, ROWS);
-          const k  = cellKey(nx, ny);
-          if (visited.has(k) || blocked.has(k)) continue;
-          const np = [...path, { x: nx, y: ny }];
-          if (nx === gx && ny === gy) return np;
-          visited.add(k);
-          queue.push({ x: nx, y: ny, path: np });
-        }
-      }
-      return null;
     }
 
     // ── Bot: flood fill ────────────────────────────────────────────────────────
@@ -365,199 +206,93 @@
       return visited.size;
     }
 
-    // ── Bot: fast reachability check (no path stored, O(cells)) ──────────────
-    // Used in survival mode to verify the tail is still accessible from each
-    // candidate neighbour without the cost of storing full path arrays.
-
-    function canReach(sx, sy, gx, gy, blocked) {
-      const visited = new Set();
-      const queue   = [{ x: sx, y: sy }];
-      visited.add(cellKey(sx, sy));
-      while (queue.length) {
-        const { x, y } = queue.shift();
-        if (x === gx && y === gy) return true;
-        for (const d of DIRS) {
-          const nx = wrap(x + d.x, COLS);
-          const ny = wrap(y + d.y, ROWS);
-          const k  = cellKey(nx, ny);
-          if (!visited.has(k) && !blocked.has(k)) {
-            visited.add(k);
-            queue.push({ x: nx, y: ny });
-          }
-        }
-      }
-      return false;
-    }
-
     // ── Bot: main step ─────────────────────────────────────────────────────────
 
+    // Strategy: a boustrophedon Hamiltonian cycle is the backbone — following it
+    // blindly visits every cell exactly once and closes into a loop, so the snake
+    // can NEVER trap itself and deterministically fills the board.  Blindly
+    // following it is slow, so we allow "shortcuts": the head may jump forward
+    // along the cycle (to an adjacent cell with a higher cycle index) toward the
+    // food, but only as far as it can WITHOUT overtaking the tail.  The exact
+    // amount it may safely cut is rel(head, tail) − 1 cells in cycle order; this
+    // single invariant — the tail always stays ahead of the head along the cycle —
+    // is what makes every move provably safe.  Shortcuts switch off once the board
+    // is half full, so the end-game is pure cycle-following and the board fills to
+    // (essentially) 400.  A flood-fill fallback recovers if the bot is toggled on
+    // while the snake is in an arbitrary, non-cycle-aligned shape.
+
     function botStep() {
+      const N    = COLS * ROWS;
       const head = snake[0];
       const tail = snake[snake.length - 1];
+      const bodySet = new Set(snake.map(s => cellKey(s.x, s.y)));
 
-      // Conservative bodySet includes the tail so paths never route through it.
-      const bodySet      = new Set(snake.map(s => cellKey(s.x, s.y)));
-      // bodySetNoTail used only where the tail itself is the goal/destination.
-      const bodySetNoTail = new Set(snake.slice(0, -1).map(s => cellKey(s.x, s.y)));
+      const headPos = HAM_POS[cellKey(head.x, head.y)];
+      const tailPos = HAM_POS[cellKey(tail.x, tail.y)];
+      const foodPos = HAM_POS[cellKey(food.x, food.y)];
 
-      const dangerMap  = buildDangerMap();
-      const isCycling  = survivalStreak > CYCLE_THRESHOLD;
+      // Forward distance along the cycle from a to b (0 … N-1).
+      const rel = (a, b) => (b - a + N) % N;
 
-      // ── 0. Hamiltonian cycle mode (snake.length ≥ HAM_THRESHOLD) ─────────────
-      // At high density a boustrophedon Hamiltonian cycle eliminates dead ends by
-      // design: the snake sweeps each row completely before U-turning to the next,
-      // closing the loop via the toroidal bottom edge.
-      //
-      // Three-tier strategy that matches — never undercuts — the quality of the
-      // normal Dijkstra + flood-fill tiers below:
-      //   a) Dijkstra shortcut with the SAME open-space threshold as tier 1
-      //      (60 % normal / 40 % cycling).  A more lenient gate here was the
-      //      root cause of the performance regression: it approved paths that
-      //      tier 1 would correctly reject, leaving the snake in worse positions.
-      //   b) Flood-fill survival identical to tier 2, but with the Hamiltonian
-      //      cycle direction used as a tiebreaker when two neighbours are equal.
-      //      This keeps the snake space-aware while gently nudging it along the
-      //      cycle so it doesn't need to rely on the strict step as often.
-      //   c) Strict cycle step only as a true last resort — when every neighbour
-      //      fails the flood-fill minimum.  Previously this fired as soon as (a)
-      //      failed, overriding the flood-fill logic and causing avoidable deaths.
-      if (snake.length >= HAM_THRESHOLD) {
-        // — a) Dijkstra shortcut (same threshold as tier 1) —
-        const hamPath = dijkstraToFood(bodySet, dangerMap);
-        if (hamPath) {
-          const hamFinal = simulatePath(hamPath);
-          if (hamFinal) {
-            const hamBlocked = new Set(hamFinal.slice(1).map(s => cellKey(s.x, s.y)));
-            const hamOpen    = floodFill(hamFinal[0].x, hamFinal[0].y, hamBlocked);
-            const hamAvail   = COLS * ROWS - hamBlocked.size;
-            const hamRatio   = isCycling ? 0.4 : 0.6;
-            if (hamOpen >= Math.max(4, Math.ceil(hamAvail * hamRatio))) {
-              survivalStreak = 0;
-              setNextDir(head, hamPath[0]);
-              botStatus.textContent = 'HAM-HUNT';
-              return;
-            }
-          }
-        }
+      const distToTail = rel(headPos, tailPos);
+      const distToFood = rel(headPos, foodPos);
+      const emptyAhead = N - snake.length;
 
-        // — b) Flood-fill survival with cycle tiebreaker —
-        const cycleNext       = hamCycleNext(head.x, head.y);
-        const minHamSpace     = Math.max(4, Math.floor(snake.length * 0.15));
-        let hamBestSpace = -1, hamBestD = null;
-        for (const d of DIRS) {
-          const nx = wrap(head.x + d.x, COLS);
-          const ny = wrap(head.y + d.y, ROWS);
-          if (bodySet.has(cellKey(nx, ny))) continue;
-          const space = floodFill(nx, ny, bodySet);
-          if (space < minHamSpace) continue;
-          // Prefer cycle direction on ties to gently align with the Hamiltonian path
-          const isCycleDir = nx === cycleNext.x && ny === cycleNext.y;
-          if (space > hamBestSpace || (space === hamBestSpace && isCycleDir)) {
-            hamBestSpace = space; hamBestD = d;
-          }
-        }
-        if (hamBestD) {
-          survivalStreak++;
-          nextDir = hamBestD;
-          botStatus.textContent = isCycling ? 'HAM-CYCLE' : 'HAM-SURVIVE';
-          return;
-        }
+      // How far we may cut this move:
+      //   • Never cut past the tail: leave ≥1 cell of slack  → distToTail − 1.
+      //     (This also absorbs the one-tick growth when the cut lands on food.)
+      //   • Never overshoot the food, and only cut when the food lies ahead of us
+      //     inside that safe window; otherwise just ride the cycle until it does.
+      //   • Stop cutting once the board is half full, so the end-game is pure
+      //     cycle-following and the board fills completely.
+      let cutting = 0;
+      if (distToFood <= distToTail - 1) cutting = distToFood;
+      if (emptyAhead < N * 0.5)         cutting = 0;
 
-        // — c) Strict cycle step (true last resort) —
-        const cycleKey = cellKey(cycleNext.x, cycleNext.y);
-        const isTail   = cycleNext.x === tail.x && cycleNext.y === tail.y;
-        if (!bodySet.has(cycleKey) || isTail) {
-          survivalStreak = 0;
-          setNextDir(head, cycleNext);
-          botStatus.textContent = 'HAMILTONIAN';
-          return;
-        }
-        // Cycle step blocked after shortcuts → fall through to regular last resort.
+      // Examine the four neighbours.  Among free cells, take the largest legal
+      // forward jump (best shortcut); otherwise fall back to the plain cycle step.
+      let shortcutDir = null, shortcutDist = 0;
+      let cycleDir    = null;                       // the dist === 1 neighbour
+      let anyFree     = false;
+
+      for (const d of DIRS) {
+        const nx = wrap(head.x + d.x, COLS);
+        const ny = wrap(head.y + d.y, ROWS);
+        const k  = cellKey(nx, ny);
+        const isTail = (nx === tail.x && ny === tail.y);
+        if (bodySet.has(k) && !isTail) continue;    // occupied (tail vacates this tick)
+        anyFree = true;
+
+        const dist = rel(headPos, HAM_POS[k]);      // 1 … N-1
+        if (dist === 1) cycleDir = d;
+        if (dist <= cutting && dist > shortcutDist) { shortcutDist = dist; shortcutDir = d; }
       }
 
-      // ── 1. Weighted Dijkstra → food ──────────────────────────────────────────
-      const path = dijkstraToFood(bodySet, dangerMap);
-
-      if (path) {
-        const finalSnake = simulatePath(path);
-        if (finalSnake) {
-          const futureBlocked = new Set(finalSnake.slice(1).map(s => cellKey(s.x, s.y)));
-          const openSpace     = floodFill(finalSnake[0].x, finalSnake[0].y, futureBlocked);
-
-          // Gate: require access to a meaningful fraction of the FREE cells
-          // from the food position — not an absolute count equal to snake length,
-          // which becomes impossible at high density (snake = 200, grid = 400 →
-          // only 200 cells are free total, so the old check could never pass).
-          // availableCells = total grid minus everything that stays blocked after eating.
-          const availableCells = COLS * ROWS - futureBlocked.size;
-          const ratio     = isCycling ? 0.4 : 0.6;
-          const threshold = Math.max(4, Math.ceil(availableCells * ratio));
-
-          if (openSpace >= threshold) {
-            survivalStreak = 0;
-            setNextDir(head, path[0]);
-            botStatus.textContent = isCycling ? 'BREAKING' : 'HUNTING';
-            return;
-          }
-        }
+      if (shortcutDir && shortcutDist > 1) {
+        nextDir = shortcutDir;
+        botStatus.textContent = 'SHORTCUT';
+        return;
+      }
+      if (cycleDir) {
+        nextDir = cycleDir;
+        botStatus.textContent = emptyAhead < N * 0.5 ? 'HAMILTONIAN' : 'CYCLE';
+        return;
       }
 
-      // ── 2. Survival: gravitate toward maximum open space ─────────────────────
-      //
-      // Previous version used canReach(neighbour → tail) as a safety gate, but
-      // at high densities (50 %+ of the grid filled) the tail is buried inside
-      // the coil and genuinely unreachable from the open area — even though
-      // the open area is the safest place to be.  The strict check caused the
-      // bot to stay near the body (where the tail is reachable) and never enter
-      // the large free zone where the food is.
-      //
-      // Fix: replace canReach with a flood-fill minimum threshold.  As long as
-      // a direction opens onto enough free space, it is safe to take.  Pure
-      // flood-fill maximisation already avoids pockets naturally.
-
-      const minSurvivalSpace = Math.max(4, Math.floor(snake.length * 0.15));
-
+      // ── Fallback: the cycle step is blocked (snake not cycle-aligned, e.g. the
+      // bot was switched on mid-game).  Survive by moving into the largest
+      // reachable open space; this re-aligns the snake with the cycle over the
+      // next few ticks, after which the logic above resumes.
       let bestSpace = -1, bestD = null;
       for (const d of DIRS) {
         const nx = wrap(head.x + d.x, COLS);
         const ny = wrap(head.y + d.y, ROWS);
-        if (bodySet.has(cellKey(nx, ny))) continue;          // collision
-
+        if (bodySet.has(cellKey(nx, ny))) continue;
         const space = floodFill(nx, ny, bodySet);
-        if (space < minSurvivalSpace) continue;              // avoid tiny pockets
         if (space > bestSpace) { bestSpace = space; bestD = d; }
       }
-
-      if (bestD) {
-        survivalStreak++;
-        nextDir = bestD;
-        botStatus.textContent = isCycling ? 'CYCLE BREAK' : 'SURVIVING';
-        return;
-      }
-
-      // ── 3. Last resort: any safe direction, most open space ──────────────────
-      // (tail unreachable from all neighbours — very cornered)
-      let fallbackSpace = -1, fallbackD = null;
-      for (const d of DIRS) {
-        const nx = wrap(head.x + d.x, COLS);
-        const ny = wrap(head.y + d.y, ROWS);
-        if (!bodySet.has(cellKey(nx, ny))) {
-          const sp = floodFill(nx, ny, bodySet);
-          if (sp > fallbackSpace) { fallbackSpace = sp; fallbackD = d; }
-        }
-      }
-
-      if (fallbackD) { survivalStreak++; nextDir = fallbackD; botStatus.textContent = 'ESCAPING'; }
-      else            { botStatus.textContent = 'TRAPPED'; }
-    }
-
-    function setNextDir(from, to) {
-      let dx = to.x - from.x;
-      let dy = to.y - from.y;
-      // Handle toroidal wrap-around
-      if (dx >  1) dx = -1; if (dx < -1) dx = 1;
-      if (dy >  1) dy = -1; if (dy < -1) dy = 1;
-      nextDir = { x: dx, y: dy };
+      if (bestD) { nextDir = bestD; botStatus.textContent = 'RECOVER'; }
+      else       { botStatus.textContent = 'TRAPPED'; }
     }
 
     // ── Game core ──────────────────────────────────────────────────────────────
@@ -571,7 +306,6 @@
       dir = { x: 1, y: 0 };
       nextDir = { x: 1, y: 0 };
       score = 0;
-      survivalStreak = 0;
       scoreEl.textContent = 0;
       placeFood();
     }
@@ -611,6 +345,10 @@
         score++;
         scoreEl.textContent = score;
         if (score > best) { best = score; bestEl.textContent = best; }
+        // ── Win: the snake now fills every cell.  Without this guard placeFood()
+        // would spin forever looking for a free cell that doesn't exist, freezing
+        // the tab — the "unresponsive at the very end" symptom.
+        if (snake.length === COLS * ROWS) { draw(); return youWin(); }
         placeFood();
       } else {
         snake.pop();
@@ -689,6 +427,18 @@
       overlayTitle.style.color = '#e94560';
       overlay.style.display = 'flex';
       overlay.children[1].textContent = `Score: ${score}`;
+      overlay.children[2].innerHTML = 'Press <span class="key">SPACE</span> to play again';
+    }
+
+    function youWin() {
+      clearInterval(interval);
+      state = 'over';
+      botStatus.textContent = botActive ? 'PERFECT — 400/400' : '';
+      if (botActive) { setTimeout(startGame, 1500); return; }
+      overlayTitle.textContent = 'PERFECT!';
+      overlayTitle.style.color = '#4ecca3';
+      overlay.style.display = 'flex';
+      overlay.children[1].textContent = `Filled the whole grid — Score: ${score}`;
       overlay.children[2].innerHTML = 'Press <span class="key">SPACE</span> to play again';
     }
 
